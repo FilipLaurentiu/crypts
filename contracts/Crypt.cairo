@@ -1,5 +1,4 @@
 %lang starknet
-%builtins pedersen range_check ecdsa
 
 from starkware.cairo.common.cairo_builtins import HashBuiltin, SignatureBuiltin
 from starkware.starknet.common.syscalls import get_caller_address, get_contract_address
@@ -101,6 +100,9 @@ end
 #############################################
 ##                FEE LOGIC                ##
 #############################################
+@event
+func FeePercentUpdated(user : felt, newFeePercent : felt):
+end
 
 ## Fee Configuration ##
 @external
@@ -113,6 +115,8 @@ func setFeePercent{
 ):
     assert_lt(0, fee)
     FEE_PERCENT.write(fee)
+    let (caller : felt) = get_caller_address()
+    FeePercentUpdated.emit(caller, fee)
     return ()
 end
 
@@ -132,6 +136,10 @@ end
 func NEXT_HARVEST_DELAY() -> (delay: felt):
 end
 
+@event 
+func HarvestWindowUpdated(user : felt, newHarvestWindow : felt):
+end
+
 ## @notice Sets a new harvest window.
 ## @param newHarvestWindow The new harvest window.
 ## @dev HARVEST_DELAY must be set before calling.
@@ -147,6 +155,8 @@ func setHarvestWindow{
     let (delay) = HARVEST_DELAY.read()
     assert_le(window, delay)
     HARVEST_WINDOW.write(window)
+    let (caller : felt) = get_caller_address()
+    HarvestDelayUpdated.emit(caller, window)
     return ()
 end
 
@@ -168,11 +178,14 @@ func setHarvestDelay{
     assert_not_zero(new_delay)
     assert_le(new_delay, 31536000) # 31,536,000 = 365 days = 1 year
 
+    let (caller : felt) = get_caller_address()
     # If the previous delay is 0, we should set immediately
     if delay == 0:
-        HARVEST_DELAY.write(new_delay)
+        harvest_delay.write(new_delay)
+        HarvestDelayUpdated.emit(caller, new_delay)
     else:
-        NEXT_HARVEST_DELAY.write(new_delay)
+        next_harvest_delay.write(new_delay)
+        HarvestDelayUpdateScheduled.emit(caller, new_delay)
     end
     return ()
 end
@@ -186,6 +199,10 @@ end
 ## @dev A fixed point number where 1e18 represents 100% and 0 represents 0%.
 @storage_var
 func TARGET_FLOAT_PERCENT() -> (percent: Uint256):
+end
+
+@event 
+func TargetFloatPercentUpdated(user : felt, newTargetFloatPercent : Uint256):
 end
 
 # const MAX_UINT256 = Uint256(2**128-1, 2**128-1)
@@ -207,6 +224,8 @@ func setTargetFloatPercent{
     let (local lt: felt) = uint256_lt(new_float, Uint256(2**128-1, 2**128-1))
     assert lt = 1
     TARGET_FLOAT_PERCENT.write(new_float)
+    let (caller : felt) = get_caller_address()
+    TargetFloatPercentUpdated.emit(caller, new_float)
     return ()
 end
 
@@ -373,7 +392,7 @@ end
 ## @dev Only withdraws from strategies if needed and maintains the target float percentage if possible.
 ## @param recipient The user to transfer the underlying tokens to.
 ## @param underlyingAmount The amount of underlying tokens to transfer.
-function transferUnderlyingTo(address recipient, uint256 underlyingAmount) internal {
+func transferUnderlyingTo(address recipient, uint256 underlyingAmount) internal {
     // Get the Vault's floating balance.
     uint256 float = totalFloat();
 
@@ -417,44 +436,59 @@ function exchangeRate() public view returns (uint256) {
     return totalHoldings().fdiv(rvTokenSupply, BASE_UNIT);
 }
 
-/// @notice Calculates the total amount of underlying tokens the Vault holds.
-/// @return totalUnderlyingHeld The total amount of underlying tokens the Vault holds.
-function totalHoldings() public view returns (uint256 totalUnderlyingHeld) {
-    unchecked {
-        // Cannot underflow as locked profit can't exceed total strategy holdings.
-        totalUnderlyingHeld = totalStrategyHoldings - lockedProfit();
-    }
+# @notice Calculates the total amount of underlying tokens the Vault holds.
+# @return totalUnderlyingHeld The total amount of underlying tokens the Vault holds.
+@view
+func totalHoldings{syscall_ptr : felt*, pedersen_ptr : HashBuiltin*, range_check_ptr}() -> (
+    total_underlying_held : Uint256
+):
+    let (locked_profit : Uint256) = lockedProfit()
+    let (current_total_strategy_holdings : Uint256) = total_strategy_holdings.read() 
+    let (total_underlying_held : Uint256) = uint256_checked_sub_le(current_total_strategy_holdings, locked_profit)
+    let (total_float : Uint256) = totalFloat()
+    let(add_float : Uint256) = uint256_checked_add(total_underlying_held, total_float)
+    return (add_float)
+end
 
-    // Include our floating balance in the total.
-    totalUnderlyingHeld += totalFloat();
-}
+# @notice Calculates the current amount of locked profit.
+# @return The current amount of locked profit.
+@view
+func lockedProfit{syscall_ptr : felt*, pedersen_ptr : HashBuiltin*, range_check_ptr}() -> (
+    res : felt
+):
+    alloc_locals
+    let (previous_harvest : felt) = last_harvest.read()
+    let (harvest_interval : felt) = harvest_delay.read()
+    let (block_timestamp : felt) = get_block_timestamp()
+    
+    let (harvest_delay_passed : felt) = is_le(previous_harvest + harvest_interval, block_timestamp)
+    # If the harvest delay has passed, there is no locked profit.
+    # Cannot overflow on human timescales since harvestInterval is capped.
+    if harvest_delay_passed == TRUE:
+        return (0)
+    end
 
-/// @notice Calculates the current amount of locked profit.
-/// @return The current amount of locked profit.
-function lockedProfit() public view returns (uint256) {
-    // Get the last harvest and harvest delay.
-    uint256 previousHarvest = lastHarvest;
-    uint256 harvestInterval = harvestDelay;
+    let (maximum_locked_profit : felt) = max_locked_profit.read()
 
-    unchecked {
-        // If the harvest delay has passed, there is no locked profit.
-        // Cannot overflow on human timescales since harvestInterval is capped.
-        if (block.timestamp >= previousHarvest + harvestInterval) return 0;
 
-        // Get the maximum amount we could return.
-        uint256 maximumLockedProfit = maxLockedProfit;
+    # Compute how much profit remains locked based on the last harvest and harvest delay.
+    # It's impossible for the previous harvest to be in the future, so this will never underflow.
+    # maximumLockedProfit - (maximumLockedProfit * (block.timestamp - previousHarvest)) / harvestInterval;
+    let sub = block_timestamp - previous_harvest
+    let mul = maximum_locked_profit * sub
+    let div = mul / harvest_interval
+    return (maximum_locked_profit - div)
+end
 
-        // Compute how much profit remains locked based on the last harvest and harvest delay.
-        // It's impossible for the previous harvest to be in the future, so this will never underflow.
-        return maximumLockedProfit - (maximumLockedProfit * (block.timestamp - previousHarvest)) / harvestInterval;
-    }
-}
-
-/// @notice Returns the amount of underlying tokens that idly sit in the Vault.
-/// @return The amount of underlying tokens that sit idly in the Vault.
-function totalFloat() public view returns (uint256) {
-    return UNDERLYING.balanceOf(address(this));
-}
+# @notice Returns the amount of underlying tokens that idly sit in the Vault.
+# @return The amount of underlying tokens that sit idly in the Vault.
+@view
+func totalFloat{syscall_ptr : felt*, pedersen_ptr : HashBuiltin*, range_check_ptr}() -> (
+    float : Uint256
+):
+    let (current_float_percent : Uint256) = TARGET_FLOAT_PERCENT.read()
+    return (current_float_percent)
+end
 
 #############################################
 ##              HARVEST LOGIC              ##
